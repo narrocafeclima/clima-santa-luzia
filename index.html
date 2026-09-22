@@ -98,7 +98,40 @@ function renderModels(list){const labels=list[0].data.daily.time;$('modelGrid').
 $('modelTable').innerHTML=labels.map((d,i)=>{const v=list.map(m=>n(m.data.daily.precipitation_sum[i])),lo=Math.min(...v),hi=Math.max(...v);return '<tr><td>'+dayLabel(d)+'</td>'+v.map(x=>'<td>'+fmt(x,1)+'</td>').join('')+'<td>'+fmt(lo,1)+'–'+fmt(hi,1)+'</td></tr>'}).join('');
 const tw=list.map(m=>sum(m.data.daily.precipitation_sum.slice(0,2))),mean=avg(tw),spread=Math.max(...tw)-Math.min(...tw),rel=mean>1?spread/mean:spread,conf=rel<.35?'ALTA':rel<.8?'MÉDIA':'BAIXA';$('confidence').textContent=conf;$('confidence').className='consensus '+(conf==='ALTA'?'high':conf==='MÉDIA'?'medium':'low');$('confidenceText').textContent='Faixa hoje + amanhã: '+fmt(Math.min(...tw),1)+' a '+fmt(Math.max(...tw),1)+' mm.'}
 function iso(d){return d.toISOString().slice(0,10)}async function loadHistory(){const e=new Date();e.setDate(e.getDate()-5);const s=new Date(e);s.setDate(s.getDate()-29);const h=await j('https://archive-api.open-meteo.com/v1/archive?latitude='+LAT+'&longitude='+LON+'&start_date='+iso(s)+'&end_date='+iso(e)+'&daily=temperature_2m_max,temperature_2m_min,precipitation_sum&timezone='+encodeURIComponent(TZ)),lb=h.daily.time.map(x=>x.slice(8,10)+'/'+x.slice(5,7));kill('histRain');kill('histTemp');charts.histRain=new Chart($('histRainChart'),{type:'bar',data:{labels:lb,datasets:[{label:'Chuva mm',data:h.daily.precipitation_sum}]},options:{responsive:true,maintainAspectRatio:false,scales:{x:{ticks:{maxTicksLimit:8}},y:{beginAtZero:true}}}});charts.histTemp=new Chart($('histTempChart'),{type:'line',data:{labels:lb,datasets:[{label:'Máxima °C',data:h.daily.temperature_2m_max,tension:.2,pointRadius:0},{label:'Mínima °C',data:h.daily.temperature_2m_min,tension:.2,pointRadius:0}]},options:{responsive:true,maintainAspectRatio:false,scales:{x:{ticks:{maxTicksLimit:8}}}}})}
-async function loadWeather(){try{$('sync').textContent='Atualizando…';const ids=['ecmwf_ifs','ecmwf_aifs025_single','ncep_gfs_global','icon_global'];const [b,mods]=await Promise.all([j(baseUrl()),Promise.all(ids.map(id=>j(modelUrl(id)).then(data=>({id,data}))))]);renderBase(b);renderModels(mods);$('sync').textContent='Atualizado '+new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'})}catch(e){console.error(e);$('sync').textContent='Falha ao atualizar';$('heroTitle').textContent='Sem conexão com dados';$('heroSub').textContent='Verifique a internet e toque em Atualizar.'}}
+async function loadWeather(){
+  $('sync').textContent='Atualizando…';
+  let base=null,baseFromCache=false;
+  try{
+    base=await j(baseUrl());
+    localStorage.setItem('csl-base-cache-v1',JSON.stringify({ts:Date.now(),data:base}));
+  }catch(e){
+    console.error('Falha dados principais',e);
+    try{const c=JSON.parse(localStorage.getItem('csl-base-cache-v1')||'null');if(c&&c.data){base=c.data;baseFromCache=true}}catch(_e){}
+  }
+  if(base){
+    try{renderBase(base)}catch(e){console.error('Falha ao renderizar resumo',e)}
+  }else{
+    $('sync').textContent='Falha nos dados principais';
+    $('heroTitle').textContent='Dados meteorológicos temporariamente indisponíveis';
+    $('heroSub').textContent='O painel continua com radar e satélite. Tente Atualizar novamente em alguns minutos.';
+  }
+
+  const ids=['ecmwf_ifs','ecmwf_aifs025_single','ncep_gfs_global','icon_global'];
+  const settled=await Promise.allSettled(ids.map(id=>j(modelUrl(id)).then(data=>({id,data}))));
+  const mods=settled.filter(x=>x.status==='fulfilled').map(x=>x.value);
+  settled.filter(x=>x.status==='rejected').forEach((x,i)=>console.warn('Modelo indisponível',ids[i],x.reason));
+  if(mods.length){
+    try{renderModels(mods);localStorage.setItem('csl-model-cache-v1',JSON.stringify({ts:Date.now(),data:mods}))}catch(e){console.error('Falha ao renderizar modelos',e)}
+  }else{
+    try{const c=JSON.parse(localStorage.getItem('csl-model-cache-v1')||'null');if(c&&Array.isArray(c.data)&&c.data.length){renderModels(c.data);$('confidenceText').textContent+=' • comparação em cache'}}catch(_e){}
+    if(!$('modelGrid').innerHTML.trim()){$('modelGrid').innerHTML='<div class="note" style="grid-column:1/-1">Comparação entre modelos temporariamente indisponível. O resumo principal continua funcionando normalmente.</div>';$('confidence').textContent='—';$('confidenceText').textContent='Aguardando novas rodadas dos modelos.'}
+  }
+  if(base){
+    const t=new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
+    $('sync').textContent=baseFromCache?'Dados salvos • '+t:'Atualizado '+t;
+    if(baseFromCache){$('heroSub').textContent+=' • Exibindo último dado salvo enquanto a fonte principal reconecta.'}
+  }
+}
 function initRadar(){if(radarMap)return;radarMap=L.map('radarMap',{zoomControl:true,maxZoom:12}).setView([LAT,LON],7);L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18,attribution:'© OpenStreetMap'}).addTo(radarMap);L.circleMarker([LAT,LON],{radius:6,color:'#fff',weight:2,fillColor:'#d9362b',fillOpacity:1}).addTo(radarMap).bindTooltip('Fazenda Santa Luzia',{permanent:false,direction:'top'});loadRadar()}
 async function loadRadar(){try{const d=await j('https://api.rainviewer.com/public/weather-maps.json');radarFrames=(d.radar&&d.radar.past)||[];radarHost=d.host||'https://tilecache.rainviewer.com';if(!radarFrames.length)throw new Error('Sem quadros');radarIndex=radarFrames.length-1;$('radarSlider').max=radarFrames.length-1;$('radarSlider').value=radarIndex;showRadar()}catch(e){console.error(e);$('radarTime').textContent='Radar indisponível no momento'}}
 function showRadar(){if(!radarFrames.length)return;const f=radarFrames[radarIndex];if(radarLayer)radarMap.removeLayer(radarLayer);radarLayer=L.tileLayer(radarHost+f.path+'/256/{z}/{x}/{y}/2/1_1.png',{opacity:.68,zIndex:500,maxNativeZoom:7,maxZoom:12,minZoom:0,keepBuffer:2}).addTo(radarMap);$('radarSlider').value=radarIndex;$('radarTime').textContent=new Date(f.time*1000).toLocaleString('pt-BR',{hour:'2-digit',minute:'2-digit',day:'2-digit',month:'2-digit'})+' • radar nativo até zoom 7'}
