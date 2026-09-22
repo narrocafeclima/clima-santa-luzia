@@ -79,9 +79,85 @@ const LAT=-22.3985625,LON=-49.8393125,TZ='America/Sao_Paulo';
 const $=id=>document.getElementById(id);const charts={};let radarMap,radarLayer,radarFrames=[],radarIndex=0,radarTimer=null,radarHost='https://tilecache.rainviewer.com';
 function n(v){return Number(v)||0}function sum(a){return a.reduce((x,y)=>x+n(y),0)}function avg(a){return a.length?sum(a)/a.length:0}function max(a){return Math.max(...a.map(n))}function fmt(v,d=0){return Number.isFinite(Number(v))?Number(v).toFixed(d):'—'}function kill(k){if(charts[k]){charts[k].destroy();charts[k]=null}}
 function dayLabel(s){return new Date(s+'T12:00:00').toLocaleDateString('pt-BR',{weekday:'short',day:'2-digit'}).replace('.','')}
-async function j(url){const r=await fetch(url,{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);return r.json()}
+async function j(url,timeoutMs=9000){
+  const ctl=new AbortController(),timer=setTimeout(()=>ctl.abort(),timeoutMs);
+  try{
+    const r=await fetch(url,{cache:'no-store',signal:ctl.signal,headers:{'Accept':'application/json'}});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    return await r.json();
+  }finally{clearTimeout(timer)}
+}
 function baseUrl(){return 'https://api.open-meteo.com/v1/forecast?latitude='+LAT+'&longitude='+LON+'&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m,wind_gusts_10m,cloud_cover&hourly=temperature_2m,relative_humidity_2m,precipitation_probability,precipitation,wind_speed_10m,wind_gusts_10m&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,wind_gusts_10m_max&timezone='+encodeURIComponent(TZ)+'&forecast_days=7'}
 function modelUrl(m){return 'https://api.open-meteo.com/v1/forecast?latitude='+LAT+'&longitude='+LON+'&daily=precipitation_sum,temperature_2m_max,temperature_2m_min,wind_gusts_10m_max&models='+m+'&timezone='+encodeURIComponent(TZ)+'&forecast_days=7'}
+function metNoUrl(){return 'https://api.met.no/weatherapi/locationforecast/2.0/compact?lat='+LAT.toFixed(4)+'&lon='+LON.toFixed(4)}
+function metCode(symbol){
+  symbol=(symbol||'').toLowerCase();
+  if(symbol.includes('thunder'))return 95;
+  if(symbol.includes('heavyrain'))return 65;
+  if(symbol.includes('rain'))return 61;
+  if(symbol.includes('sleet')||symbol.includes('snow'))return 71;
+  if(symbol.includes('fog'))return 45;
+  if(symbol.includes('cloudy'))return 3;
+  if(symbol.includes('partlycloudy'))return 2;
+  return 0;
+}
+function metToBase(raw){
+  const ts=(raw&&raw.properties&&raw.properties.timeseries)||[];
+  if(!ts.length)throw new Error('MET Norway sem dados');
+  const rows=ts.slice(0,24*9).map(x=>{
+    const inst=(x.data&&x.data.instant&&x.data.instant.details)||{};
+    const n1=(x.data&&x.data.next_1_hours)||{};
+    const n6=(x.data&&x.data.next_6_hours)||{};
+    const det1=n1.details||{},det6=n6.details||{};
+    const precip=Number(det1.precipitation_amount ?? (det6.precipitation_amount!=null?det6.precipitation_amount/6:0))||0;
+    const pop=Number(det1.probability_of_precipitation ?? det6.probability_of_precipitation ?? (precip>=1?80:precip>0?50:10))||0;
+    const symbol=(n1.summary&&n1.summary.symbol_code)||(n6.summary&&n6.summary.symbol_code)||'';
+    const wind=(Number(inst.wind_speed)||0)*3.6;
+    const gust=(Number(inst.wind_speed_of_gust ?? inst.wind_speed)||0)*3.6;
+    return {time:x.time.slice(0,16),temp:Number(inst.air_temperature),hum:Number(inst.relative_humidity),rain:precip,pop:pop,wind:wind,gust:gust,cloud:Number(inst.cloud_area_fraction)||0,code:metCode(symbol)};
+  });
+  const now=rows[0];
+  const dayMap={};
+  rows.forEach(r=>{
+    const d=r.time.slice(0,10);
+    if(!dayMap[d])dayMap[d]={temps:[],rain:0,pop:[],gust:[],codes:[]};
+    const z=dayMap[d];z.temps.push(r.temp);z.rain+=r.rain;z.pop.push(r.pop);z.gust.push(r.gust);z.codes.push(r.code);
+  });
+  const days=Object.keys(dayMap).sort().slice(0,7);
+  return {
+    _source:'MET Norway',
+    current:{time:now.time,temperature_2m:now.temp,relative_humidity_2m:now.hum,apparent_temperature:now.temp,precipitation:now.rain,weather_code:now.code,wind_speed_10m:now.wind,wind_gusts_10m:now.gust,cloud_cover:now.cloud},
+    hourly:{
+      time:rows.map(r=>r.time),
+      temperature_2m:rows.map(r=>r.temp),
+      relative_humidity_2m:rows.map(r=>r.hum),
+      precipitation_probability:rows.map(r=>r.pop),
+      precipitation:rows.map(r=>r.rain),
+      wind_speed_10m:rows.map(r=>r.wind),
+      wind_gusts_10m:rows.map(r=>r.gust)
+    },
+    daily:{
+      time:days,
+      weather_code:days.map(d=>Math.max(...dayMap[d].codes)),
+      temperature_2m_max:days.map(d=>Math.max(...dayMap[d].temps.filter(Number.isFinite))),
+      temperature_2m_min:days.map(d=>Math.min(...dayMap[d].temps.filter(Number.isFinite))),
+      precipitation_sum:days.map(d=>dayMap[d].rain),
+      precipitation_probability_max:days.map(d=>Math.max(...dayMap[d].pop)),
+      wind_gusts_10m_max:days.map(d=>Math.max(...dayMap[d].gust))
+    }
+  };
+}
+async function fetchBase(){
+  try{
+    const b=await j(baseUrl(),8000);
+    b._source='Open-Meteo';
+    return b;
+  }catch(e){
+    console.warn('Open-Meteo indisponível, usando MET Norway',e);
+    const m=await j(metNoUrl(),8000);
+    return metToBase(m);
+  }
+}
 function win(b,h){let i=b.hourly.time.findIndex(t=>t>=b.current.time);if(i<0)i=0;const e=Math.min(i+h,b.hourly.time.length),o={time:b.hourly.time.slice(i,e)};['temperature_2m','relative_humidity_2m','precipitation_probability','precipitation','wind_speed_10m','wind_gusts_10m'].forEach(k=>o[k]=b.hourly[k].slice(i,e));return o}
 function setLamp(id,state){$(id).className='lamp '+state}
 function renderBase(b){const w24=win(b,24),w48=win(b,48),w8=win(b,8);$('temp').textContent=fmt(b.current.temperature_2m,1)+'°';$('feels').textContent='sensação '+fmt(b.current.apparent_temperature,1)+'°C';$('hum').textContent=fmt(b.current.relative_humidity_2m)+'%';$('rain24').textContent=fmt(sum(w24.precipitation),1)+' mm';$('prob24').textContent='prob. máx '+fmt(max(w24.precipitation_probability))+'%';$('gust24').textContent=fmt(max(w24.wind_gusts_10m))+' km/h';
@@ -97,12 +173,12 @@ function modelName(m){return({ecmwf_ifs:'ECMWF IFS',ecmwf_aifs025_single:'ECMWF 
 function renderModels(list){const labels=list[0].data.daily.time;$('modelGrid').innerHTML=list.map(m=>'<div class="model"><div class="modelName">'+modelName(m.id)+'</div><div class="modelValue">'+fmt(sum(m.data.daily.precipitation_sum.slice(0,2)),1)+' mm</div><div class="small">hoje + amanhã</div></div>').join('');kill('models');charts.models=new Chart($('modelsChart'),{type:'line',data:{labels:labels.map(dayLabel),datasets:list.map(m=>({label:modelName(m.id),data:m.data.daily.precipitation_sum,tension:.25}))},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{boxWidth:12}}},scales:{y:{beginAtZero:true,title:{display:true,text:'mm/dia'}}}}});
 $('modelTable').innerHTML=labels.map((d,i)=>{const v=list.map(m=>n(m.data.daily.precipitation_sum[i])),lo=Math.min(...v),hi=Math.max(...v);return '<tr><td>'+dayLabel(d)+'</td>'+v.map(x=>'<td>'+fmt(x,1)+'</td>').join('')+'<td>'+fmt(lo,1)+'–'+fmt(hi,1)+'</td></tr>'}).join('');
 const tw=list.map(m=>sum(m.data.daily.precipitation_sum.slice(0,2))),mean=avg(tw),spread=Math.max(...tw)-Math.min(...tw),rel=mean>1?spread/mean:spread,conf=rel<.35?'ALTA':rel<.8?'MÉDIA':'BAIXA';$('confidence').textContent=conf;$('confidence').className='consensus '+(conf==='ALTA'?'high':conf==='MÉDIA'?'medium':'low');$('confidenceText').textContent='Faixa hoje + amanhã: '+fmt(Math.min(...tw),1)+' a '+fmt(Math.max(...tw),1)+' mm.'}
-function iso(d){return d.toISOString().slice(0,10)}async function loadHistory(){const e=new Date();e.setDate(e.getDate()-5);const s=new Date(e);s.setDate(s.getDate()-29);const h=await j('https://archive-api.open-meteo.com/v1/archive?latitude='+LAT+'&longitude='+LON+'&start_date='+iso(s)+'&end_date='+iso(e)+'&daily=temperature_2m_max,temperature_2m_min,precipitation_sum&timezone='+encodeURIComponent(TZ)),lb=h.daily.time.map(x=>x.slice(8,10)+'/'+x.slice(5,7));kill('histRain');kill('histTemp');charts.histRain=new Chart($('histRainChart'),{type:'bar',data:{labels:lb,datasets:[{label:'Chuva mm',data:h.daily.precipitation_sum}]},options:{responsive:true,maintainAspectRatio:false,scales:{x:{ticks:{maxTicksLimit:8}},y:{beginAtZero:true}}}});charts.histTemp=new Chart($('histTempChart'),{type:'line',data:{labels:lb,datasets:[{label:'Máxima °C',data:h.daily.temperature_2m_max,tension:.2,pointRadius:0},{label:'Mínima °C',data:h.daily.temperature_2m_min,tension:.2,pointRadius:0}]},options:{responsive:true,maintainAspectRatio:false,scales:{x:{ticks:{maxTicksLimit:8}}}}})}
+function iso(d){return d.toISOString().slice(0,10)}async function loadHistory(){const e=new Date();e.setDate(e.getDate()-5);const s=new Date(e);s.setDate(s.getDate()-29);const h=await j('https://archive-api.open-meteo.com/v1/archive?latitude='+LAT+'&longitude='+LON+'&start_date='+iso(s)+'&end_date='+iso(e)+'&daily=temperature_2m_max,temperature_2m_min,precipitation_sum&timezone='+encodeURIComponent(TZ),8000),lb=h.daily.time.map(x=>x.slice(8,10)+'/'+x.slice(5,7));kill('histRain');kill('histTemp');charts.histRain=new Chart($('histRainChart'),{type:'bar',data:{labels:lb,datasets:[{label:'Chuva mm',data:h.daily.precipitation_sum}]},options:{responsive:true,maintainAspectRatio:false,scales:{x:{ticks:{maxTicksLimit:8}},y:{beginAtZero:true}}}});charts.histTemp=new Chart($('histTempChart'),{type:'line',data:{labels:lb,datasets:[{label:'Máxima °C',data:h.daily.temperature_2m_max,tension:.2,pointRadius:0},{label:'Mínima °C',data:h.daily.temperature_2m_min,tension:.2,pointRadius:0}]},options:{responsive:true,maintainAspectRatio:false,scales:{x:{ticks:{maxTicksLimit:8}}}}})}
 async function loadWeather(){
   $('sync').textContent='Atualizando…';
   let base=null,baseFromCache=false;
   try{
-    base=await j(baseUrl());
+    base=await fetchBase();
     localStorage.setItem('csl-base-cache-v1',JSON.stringify({ts:Date.now(),data:base}));
   }catch(e){
     console.error('Falha dados principais',e);
@@ -117,7 +193,7 @@ async function loadWeather(){
   }
 
   const ids=['ecmwf_ifs','ecmwf_aifs025_single','ncep_gfs_global','icon_global'];
-  const settled=await Promise.allSettled(ids.map(id=>j(modelUrl(id)).then(data=>({id,data}))));
+  const settled=await Promise.allSettled(ids.map(id=>j(modelUrl(id),8000).then(data=>({id,data}))));
   const mods=settled.filter(x=>x.status==='fulfilled').map(x=>x.value);
   settled.filter(x=>x.status==='rejected').forEach((x,i)=>console.warn('Modelo indisponível',ids[i],x.reason));
   if(mods.length){
@@ -128,12 +204,12 @@ async function loadWeather(){
   }
   if(base){
     const t=new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
-    $('sync').textContent=baseFromCache?'Dados salvos • '+t:'Atualizado '+t;
+    $('sync').textContent=baseFromCache?'Dados salvos • '+t:'Atualizado '+t+' • '+(base._source||'fonte meteorológica');
     if(baseFromCache){$('heroSub').textContent+=' • Exibindo último dado salvo enquanto a fonte principal reconecta.'}
   }
 }
 function initRadar(){if(radarMap)return;radarMap=L.map('radarMap',{zoomControl:true,maxZoom:12}).setView([LAT,LON],7);L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18,attribution:'© OpenStreetMap'}).addTo(radarMap);L.circleMarker([LAT,LON],{radius:6,color:'#fff',weight:2,fillColor:'#d9362b',fillOpacity:1}).addTo(radarMap).bindTooltip('Fazenda Santa Luzia',{permanent:false,direction:'top'});loadRadar()}
-async function loadRadar(){try{const d=await j('https://api.rainviewer.com/public/weather-maps.json');radarFrames=(d.radar&&d.radar.past)||[];radarHost=d.host||'https://tilecache.rainviewer.com';if(!radarFrames.length)throw new Error('Sem quadros');radarIndex=radarFrames.length-1;$('radarSlider').max=radarFrames.length-1;$('radarSlider').value=radarIndex;showRadar()}catch(e){console.error(e);$('radarTime').textContent='Radar indisponível no momento'}}
+async function loadRadar(){try{const d=await j('https://api.rainviewer.com/public/weather-maps.json',8000);radarFrames=(d.radar&&d.radar.past)||[];radarHost=d.host||'https://tilecache.rainviewer.com';if(!radarFrames.length)throw new Error('Sem quadros');radarIndex=radarFrames.length-1;$('radarSlider').max=radarFrames.length-1;$('radarSlider').value=radarIndex;showRadar()}catch(e){console.error(e);$('radarTime').textContent='Radar indisponível no momento'}}
 function showRadar(){if(!radarFrames.length)return;const f=radarFrames[radarIndex];if(radarLayer)radarMap.removeLayer(radarLayer);radarLayer=L.tileLayer(radarHost+f.path+'/256/{z}/{x}/{y}/2/1_1.png',{opacity:.68,zIndex:500,maxNativeZoom:7,maxZoom:12,minZoom:0,keepBuffer:2}).addTo(radarMap);$('radarSlider').value=radarIndex;$('radarTime').textContent=new Date(f.time*1000).toLocaleString('pt-BR',{hour:'2-digit',minute:'2-digit',day:'2-digit',month:'2-digit'})+' • radar nativo até zoom 7'}
 $('prevRadar').addEventListener('click',()=>{radarIndex=Math.max(0,radarIndex-1);showRadar()});$('nextRadar').addEventListener('click',()=>{radarIndex=Math.min(radarFrames.length-1,radarIndex+1);showRadar()});$('radarSlider').addEventListener('input',e=>{radarIndex=Number(e.target.value);showRadar()});$('playRadar').addEventListener('click',()=>{if(radarTimer){clearInterval(radarTimer);radarTimer=null;$('playRadar').textContent='▶ Animar';return}$('playRadar').textContent='⏸ Pausar';radarTimer=setInterval(()=>{radarIndex=(radarIndex+1)%radarFrames.length;showRadar()},700)});
 let satMode='geo';
